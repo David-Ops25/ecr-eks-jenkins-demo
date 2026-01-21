@@ -18,6 +18,8 @@ spec:
         image: REPLACED_BY_PIPELINE
         ports:
         - containerPort: 80
+      imagePullSecrets:
+      - name: dockerhub-regcred
 ---
 apiVersion: v1
 kind: Service
