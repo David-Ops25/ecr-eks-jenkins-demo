@@ -11,6 +11,7 @@ pipeline {
   environment {
     AWS_REGION     = "eu-north-1"
     CLUSTER_NAME   = "myApp"
+
     K8S_NAMESPACE  = "ecr-demo"
     DEPLOYMENT     = "ecr-demo"
     CONTAINER_NAME = "ecr-demo"
@@ -64,6 +65,7 @@ pipeline {
           sh '''
             set -euo pipefail
             DOCKER_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPO}:${IMAGE_TAG}"
+            echo "DOCKER_IMAGE=$DOCKER_IMAGE"
             docker build -t "$DOCKER_IMAGE" .
           '''
         }
@@ -97,11 +99,16 @@ pipeline {
 
             aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
 
+            # Ensure namespace exists
             kubectl get ns "$K8S_NAMESPACE" >/dev/null 2>&1 || kubectl create ns "$K8S_NAMESPACE"
-            kubectl apply -f "$K8S_MANIFEST"
 
+            # Use a real image in the manifest BEFORE apply (prevents REPLACED_BY_PIPELINE warning)
             DOCKER_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPO}:${IMAGE_TAG}"
-            kubectl set image -n "$K8S_NAMESPACE" deployment/"$DEPLOYMENT" "$CONTAINER_NAME"="$DOCKER_IMAGE"
+            if grep -q "REPLACED_BY_PIPELINE" "$K8S_MANIFEST"; then
+              sed -i "s|REPLACED_BY_PIPELINE|$DOCKER_IMAGE|g" "$K8S_MANIFEST"
+            fi
+
+            kubectl apply -f "$K8S_MANIFEST"
             kubectl rollout status -n "$K8S_NAMESPACE" deployment/"$DEPLOYMENT"
           '''
         }
@@ -110,17 +117,25 @@ pipeline {
 
     stage('Smoke test') {
       steps {
-        sh '''
-          set -euo pipefail
-          kubectl run -n "$K8S_NAMESPACE" curltest \
-            --image=curlimages/curl --rm -i --restart=Never -- \
-            curl -sS http://ecr-demo-svc | head -n 20
-        '''
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+          sh '''
+            set -euo pipefail
+            aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+            kubectl run -n "$K8S_NAMESPACE" curltest \
+              --image=curlimages/curl --rm -i --restart=Never -- \
+              curl -sS http://ecr-demo-svc | head -n 20
+          '''
+        }
       }
     }
   }
 
   post {
+    success {
+      echo "✅ Pipeline completed successfully"
+    }
+
     failure {
       echo "❌ Pipeline failed – diagnostics"
       withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
@@ -131,6 +146,10 @@ pipeline {
           kubectl get events -n "$K8S_NAMESPACE" --sort-by=.metadata.creationTimestamp | tail -n 50 || true
         '''
       }
+    }
+
+    always {
+      sh 'docker image prune -f || true'
     }
   }
 }
