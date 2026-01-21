@@ -11,7 +11,6 @@ pipeline {
   environment {
     AWS_REGION     = "eu-north-1"
     CLUSTER_NAME   = "myApp"
-
     K8S_NAMESPACE  = "ecr-demo"
     DEPLOYMENT     = "ecr-demo"
     CONTAINER_NAME = "ecr-demo"
@@ -29,52 +28,13 @@ pipeline {
       }
     }
 
-    stage('Show environment') {
-      steps {
-        sh '''
-          echo "BUILD_NUMBER=${BUILD_NUMBER}"
-          echo "GIT_COMMIT=${GIT_COMMIT:-N/A}"
-          echo "AWS_REGION=${AWS_REGION}"
-          echo "CLUSTER_NAME=${CLUSTER_NAME}"
-          echo "K8S_NAMESPACE=${K8S_NAMESPACE}"
-          echo "DOCKERHUB_REPO=${DOCKERHUB_REPO}"
-        '''
-      }
-    }
-
-    stage('Validate files') {
-      steps {
-        sh '''
-          test -f Dockerfile
-          test -f index.html
-          test -f "${K8S_MANIFEST}"
-
-          echo "=== Dockerfile ==="
-          cat Dockerfile
-
-          echo "=== Kubernetes manifest ==="
-          cat "${K8S_MANIFEST}"
-        '''
-      }
-    }
-
-    stage('Verify tools') {
-      steps {
-        sh '''
-          aws --version
-          kubectl version --client
-          docker --version
-        '''
-      }
-    }
-
     stage('Compute image tag') {
       steps {
         script {
           def shortSha = env.GIT_COMMIT ? env.GIT_COMMIT.take(7) : "nogit"
           env.IMAGE_TAG = "${env.BUILD_NUMBER}-${shortSha}"
         }
-        sh 'echo "IMAGE_TAG=${IMAGE_TAG}"'
+        sh 'echo "IMAGE_TAG=$IMAGE_TAG"'
       }
     }
 
@@ -86,6 +46,8 @@ pipeline {
           passwordVariable: 'DOCKERHUB_TOKEN'
         )]) {
           sh '''
+            set -euo pipefail
+            echo "Logging in to DockerHub as $DOCKERHUB_USERNAME"
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
           '''
         }
@@ -100,9 +62,9 @@ pipeline {
           passwordVariable: 'DOCKERHUB_TOKEN'
         )]) {
           sh '''
+            set -euo pipefail
             DOCKER_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPO}:${IMAGE_TAG}"
             docker build -t "$DOCKER_IMAGE" .
-            docker image ls | head
           '''
         }
       }
@@ -116,6 +78,7 @@ pipeline {
           passwordVariable: 'DOCKERHUB_TOKEN'
         )]) {
           sh '''
+            set -euo pipefail
             DOCKER_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPO}:${IMAGE_TAG}"
             docker push "$DOCKER_IMAGE"
           '''
@@ -123,72 +86,32 @@ pipeline {
       }
     }
 
-    stage('AWS auth sanity') {
+    stage('Deploy to EKS') {
       steps {
-        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
-          sh 'aws sts get-caller-identity'
-        }
-      }
-    }
-
-    stage('Configure kubectl') {
-      steps {
-        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+        withCredentials([
+          [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds'],
+          usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKERHUB_USERNAME', passwordVariable: 'DOCKERHUB_TOKEN')
+        ]) {
           sh '''
+            set -euo pipefail
+
             aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
-            kubectl get nodes
-          '''
-        }
-      }
-    }
 
-    stage('Pre-deploy checks') {
-      steps {
-        sh '''
-          kubectl get ns "$K8S_NAMESPACE" || kubectl create ns "$K8S_NAMESPACE"
-          kubectl get secret -n "$K8S_NAMESPACE" dockerhub-regcred
-          kubectl get deploy -n "$K8S_NAMESPACE" "$DEPLOYMENT" || true
-        '''
-      }
-    }
+            kubectl get ns "$K8S_NAMESPACE" >/dev/null 2>&1 || kubectl create ns "$K8S_NAMESPACE"
+            kubectl apply -f "$K8S_MANIFEST"
 
-    stage('Apply manifests') {
-      steps {
-        sh 'kubectl apply -f "${K8S_MANIFEST}"'
-      }
-    }
-
-    stage('Rolling deploy') {
-      steps {
-        withCredentials([usernamePassword(
-          credentialsId: 'dockerhub-creds',
-          usernameVariable: 'DOCKERHUB_USERNAME',
-          passwordVariable: 'DOCKERHUB_TOKEN'
-        )]) {
-          sh '''
             DOCKER_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPO}:${IMAGE_TAG}"
-            kubectl set image -n "$K8S_NAMESPACE" deployment/"$DEPLOYMENT" \
-              "$CONTAINER_NAME"="$DOCKER_IMAGE"
+            kubectl set image -n "$K8S_NAMESPACE" deployment/"$DEPLOYMENT" "$CONTAINER_NAME"="$DOCKER_IMAGE"
             kubectl rollout status -n "$K8S_NAMESPACE" deployment/"$DEPLOYMENT"
           '''
         }
       }
     }
 
-    stage('Post-deploy verification') {
-      steps {
-        sh '''
-          kubectl get pods -n "$K8S_NAMESPACE" -o wide
-          kubectl get svc -n "$K8S_NAMESPACE" -o wide
-          kubectl get deploy -n "$K8S_NAMESPACE" "$DEPLOYMENT" \
-            -o=jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
-        '''
-      }
-    }
-
     stage('Smoke test') {
       steps {
         sh '''
+          set -euo pipefail
           kubectl run -n "$K8S_NAMESPACE" curltest \
             --image=curlimages/curl --rm -i --restart=Never -- \
             curl -sS http://ecr-demo-svc | head -n 20
@@ -198,21 +121,16 @@ pipeline {
   }
 
   post {
-    success {
-      echo "✅ Pipeline completed successfully"
-    }
-
     failure {
-      echo "❌ Pipeline failed – collecting diagnostics"
-      sh '''
-        kubectl get pods -n "$K8S_NAMESPACE" -o wide || true
-        kubectl get events -n "$K8S_NAMESPACE" \
-          --sort-by=.metadata.creationTimestamp | tail -n 50 || true
-      '''
-    }
-
-    always {
-      sh 'docker image prune -f || true'
+      echo "❌ Pipeline failed – diagnostics"
+      withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-creds']]) {
+        sh '''
+          set +e
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" >/dev/null 2>&1 || true
+          kubectl get pods -n "$K8S_NAMESPACE" -o wide || true
+          kubectl get events -n "$K8S_NAMESPACE" --sort-by=.metadata.creationTimestamp | tail -n 50 || true
+        '''
+      }
     }
   }
 }
